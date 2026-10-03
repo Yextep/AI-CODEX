@@ -3,6 +3,7 @@ set -Eeuo pipefail
 
 REPO="openai/codex"
 NPM_PACKAGE="@openai/codex"
+OFFICIAL_INSTALL_URL="https://chatgpt.com/codex/install.sh"
 DEFAULT_INSTALL_DIR="/usr/local/bin"
 METHOD="auto"
 FORCE=0
@@ -22,23 +23,30 @@ usage() {
 Instala o actualiza Codex CLI de forma robusta.
 
 Uso:
-  ./install_or_update_codex.sh
-  ./install_or_update_codex.sh --version 0.125.0
-  ./install_or_update_codex.sh --method binary
-  ./install_or_update_codex.sh --install-dir "$HOME/.local/bin"
+  bash iou-codex.sh
+  bash iou-codex.sh --version 0.160.0
+  bash iou-codex.sh --method binary
+  bash iou-codex.sh --install-dir "$HOME/.local/bin"
 
 Opciones:
   --version VERSION      Instala una versión concreta. Por defecto usa la última release.
-  --method auto         Intenta npm y cae al binario oficial si falla. Es el valor por defecto.
+  --method auto         Usa el instalador oficial. Es el valor por defecto.
+  --method official     Usa el instalador oficial de chatgpt.com.
   --method npm          Usa solo npm.
   --method binary       Usa solo el binario oficial de GitHub.
-  --install-dir DIR     Carpeta donde instalar el binario si se usa el método binary.
-  --force               Reinstala aunque la versión actual ya coincida.
+  --install-dir DIR     Carpeta de instalación (official/auto/binary).
+  --force               Reinstala con npm/binary aunque la versión actual ya coincida.
   -h, --help            Muestra esta ayuda.
 
 Variables:
   CODEX_INSTALL_DIR     Igual que --install-dir.
   LOG_FILE              Log de instalación. Por defecto: /tmp/codex-install-update.log
+
+En Debian/Ubuntu instala las dependencias del sistema, incluido bubblewrap,
+antes de instalar o actualizar. Usa root o sudo solo para los paquetes apt;
+Codex se instala para el usuario que ejecuta este script.
+El método official/auto vuelve a ejecutar siempre el instalador para reparar
+la instalación, aunque la versión coincida. No requiere Node.js ni npm.
 USAGE
 }
 
@@ -54,7 +62,7 @@ parse_args() {
         [[ $# -ge 2 ]] || { err "Falta valor para --method"; exit 2; }
         METHOD="$2"
         case "$METHOD" in
-          auto|npm|binary) ;;
+          auto|official|npm|binary) ;;
           *) err "Método inválido: $METHOD"; exit 2 ;;
         esac
         shift 2
@@ -79,6 +87,108 @@ parse_args() {
         ;;
     esac
   done
+}
+
+ensure_prerequisites() {
+  local os package status
+  local -a packages=(ca-certificates curl tar gzip coreutils bubblewrap)
+  local -a missing=() elevate=()
+  os="$(uname -s)"
+
+  if [[ "$os" == Linux ]] && have apt-get && have dpkg-query; then
+    if [[ "$METHOD" == npm ]] && { ! have node || ! have npm; }; then
+      packages+=(nodejs npm)
+    fi
+    for package in "${packages[@]}"; do
+      status="$(dpkg-query -W -f='${Status}' "$package" 2>/dev/null || true)"
+      [[ "$status" == 'install ok installed' ]] || missing+=("$package")
+    done
+
+    if [[ ${#missing[@]} -gt 0 ]]; then
+      if [[ "$EUID" -ne 0 ]]; then
+        if ! have sudo; then
+          err "Faltan paquetes: ${missing[*]}. Instala sudo o ejecuta como root para instalarlos."
+          return 1
+        fi
+        elevate=(sudo)
+      fi
+      info "Instalando requisitos del sistema: ${missing[*]}"
+      run_logged "${elevate[@]}" apt-get update
+      run_logged "${elevate[@]}" apt-get install -y --no-install-recommends "${missing[@]}"
+      hash -r
+    fi
+  fi
+
+  if ! have curl && ! have wget; then
+    err "Falta curl o wget; instálalo con el gestor de paquetes del sistema."
+    return 1
+  fi
+  for package in tar gzip mktemp tee install; do
+    if ! have "$package"; then
+      err "Falta el comando requerido: $package. Instálalo con el gestor de paquetes del sistema."
+      return 1
+    fi
+  done
+  if [[ "$os" == Linux ]]; then
+    if ! have bwrap; then
+      err "Falta bubblewrap (comando bwrap en PATH). Instálalo con el gestor de paquetes del sistema."
+      return 1
+    fi
+    if ! bwrap --version >>"$LOG_FILE" 2>&1; then
+      err "bubblewrap está en PATH pero no se puede ejecutar. Revisa $LOG_FILE."
+      return 1
+    fi
+    info "bubblewrap disponible: $(command -v bwrap)"
+  fi
+}
+
+install_from_official() {
+  local workdir executable
+  workdir="$(mktemp -d)"
+  CLEANUP_PATHS+=("$workdir")
+
+  # Descargar primero evita ejecutar un script parcial si la red falla.
+  info "Descargando el instalador oficial de Codex"
+  download_to "$OFFICIAL_INSTALL_URL" "$workdir/install.sh" 2>&1 | tee -a "$LOG_FILE"
+  sh -n "$workdir/install.sh"
+  [[ -z "$INSTALL_DIR" ]] || INSTALL_DIR="$(mkdir -p "$INSTALL_DIR" && cd "$INSTALL_DIR" && pwd)"
+  executable="${INSTALL_DIR:-$HOME/.local/bin}/codex"
+
+  info "Instalando/actualizando Codex con el instalador oficial"
+  run_logged env CODEX_INSTALL_DIR="$(dirname "$executable")" CODEX_NON_INTERACTIVE=1 \
+    sh "$workdir/install.sh" --release "${TARGET_VERSION:-latest}"
+
+  if [[ ! -x "$executable" ]]; then
+    err "El instalador no dejó un ejecutable en $executable"
+    return 1
+  fi
+  if [[ -n "$TARGET_VERSION" ]]; then
+    verify_codex_version "$executable" "$TARGET_VERSION"
+  else
+    "$executable" --version >>"$LOG_FILE" 2>&1
+  fi
+  check_daemon "$executable"
+  info "Resultado final: $("$executable" --version) ($executable)"
+  hash -r
+  if [[ "$(command -v codex 2>/dev/null || true)" != "$executable" ]]; then
+    warn "Para usar esta instalación en tu terminal: export PATH=\"$(dirname "$executable"):\$PATH\""
+    if have codex; then
+      warn "Ahora PATH selecciona otra instalación: $(command -v codex)"
+    fi
+  fi
+}
+
+check_daemon() {
+  local executable="$1"
+  # Las versiones antiguas no tienen daemon. start deja intacto uno ya activo.
+  if "$executable" app-server daemon start --help >/dev/null 2>&1; then
+    info "Comprobando el arranque del servidor de Codex"
+    if ! run_logged "$executable" app-server daemon start; then
+      err "Codex se instaló, pero el servidor no arrancó. Revisa $LOG_FILE y ${CODEX_HOME:-$HOME/.codex}/app-server-daemon/daemon.stderr.log."
+      err "Requisitos del sandbox: https://developers.openai.com/codex/concepts/sandboxing#prerequisites"
+      return 1
+    fi
+  fi
 }
 
 cleanup_lock() {
@@ -201,7 +311,7 @@ print_environment() {
   if have npm; then
     info "npm: $(command -v npm) ($(npm --version 2>/dev/null || true))"
   else
-    warn "npm no está disponible; se usará el método binary"
+    info "npm no está disponible; el instalador oficial y el binario no lo requieren"
   fi
 }
 
@@ -388,12 +498,27 @@ install_from_github_binary() {
 
 main() {
   parse_args "$@"
+  if [[ -n "$TARGET_VERSION" ]]; then
+    TARGET_VERSION="$(normalize_version "$TARGET_VERSION")"
+    if [[ ! "$TARGET_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[[:alnum:].-]+)?$ ]]; then
+      err "Versión inválida: $TARGET_VERSION"
+      exit 2
+    fi
+  fi
+
   acquire_lock
   : >"$LOG_FILE"
-
   print_environment
+  ensure_prerequisites
 
-  local tmp_json target current
+  if [[ "$METHOD" == auto || "$METHOD" == official ]]; then
+    install_from_official
+    info "Log: $LOG_FILE"
+    warn "Si Codex estaba abierto mientras actualizabas, reinicia la sesión para cargar el binario nuevo."
+    return
+  fi
+
+  local tmp_json current
   tmp_json="$(mktemp)"
   CLEANUP_PATHS+=("$tmp_json")
 
@@ -406,6 +531,7 @@ main() {
   info "Versión objetivo: $TARGET_VERSION"
   current="$(current_codex_version || true)"
   if [[ "$FORCE" -eq 0 && -n "$current" && "$current" == "$TARGET_VERSION" ]]; then
+    check_daemon "$(command -v codex)"
     info "Codex ya está en la versión $TARGET_VERSION. Usa --force para reinstalar."
     exit 0
   fi
@@ -417,22 +543,17 @@ main() {
     binary)
       install_from_github_binary "$TARGET_VERSION"
       ;;
-    auto)
-      if try_npm_install "$TARGET_VERSION"; then
-        info "Actualización completada con npm"
-      else
-        warn "Cambiando automáticamente al método binary"
-        install_from_github_binary "$TARGET_VERSION"
-      fi
-      ;;
   esac
 
   hash -r 2>/dev/null || true
   if have codex; then
+    check_daemon "$(command -v codex)"
     info "Resultado final: $(codex --version 2>/dev/null || true)"
   fi
   info "Log: $LOG_FILE"
   warn "Si Codex estaba abierto mientras actualizabas, reinicia la sesión para cargar el binario nuevo."
 }
 
-main "$@"
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+  main "$@"
+fi
