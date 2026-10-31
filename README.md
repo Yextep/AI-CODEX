@@ -11,6 +11,7 @@ Script Bash para instalar o actualizar Codex CLI. El proyecto contiene un único
 - Para el método binario, crea una copia de respaldo de una instalación existente y verifica el nuevo ejecutable antes de sustituirlo.
 - Usa un bloqueo temporal para evitar instalaciones simultáneas y registra la salida en un archivo de log.
 - Comprueba el arranque del daemon cuando la versión instalada ofrece ese comando.
+- En PRoot (Termux con `proot-distro`), si el daemon no puede arrancar, configura Codex para usar su servidor integrado.
 
 ## Requisitos
 
@@ -63,8 +64,21 @@ Para fijar una versión, añade `--version VERSION`, sustituyendo `VERSION` por 
 - El método binario intenta reutilizar un ejecutable existente que pueda escribir; en su defecto, considera `/usr/local/bin` y después `$HOME/.local/bin`.
 - `LOG_FILE` permite cambiar el archivo de registro. Su valor predeterminado es `/tmp/codex-install-update.log`.
 - El bloqueo se guarda en `/tmp/codex-install-update.lock`.
+- `IOU_CODEX_PROOT=1` o `IOU_CODEX_PROOT=0` fuerza o descarta la detección de PRoot; por defecto es automática.
 
 Ejecuta el script con el usuario que utilizará Codex. La instalación de paquetes del sistema usa elevación de privilegios cuando es necesaria. Si el directorio elegido no está en `PATH`, el script muestra cómo añadirlo. Tras una actualización, reinicia las sesiones de Codex que ya estaban abiertas.
+
+## Termux y PRoot
+
+Desde Codex 0.166, el servidor en segundo plano (daemon) no puede arrancar dentro de `proot-distro`. Su socket se crea en `/tmp/codex-daemon-<uid>/`, y desde Android esa ruta supera el límite de 108 bytes de los sockets Unix. Sin corrección, `codex` termina con `app server did not become ready`.
+
+Cuando el script detecta PRoot y el daemon falla:
+
+- Desactiva la función `daemon_auto_start` en `~/.codex/config.toml` para que Codex use su servidor integrado, igual que con `codex --no-daemon`.
+- Detiene el daemon que queda colgado y elimina el enlace de socket roto.
+- Si `daemon_auto_start` ya está desactivado, no vuelve a lanzar el daemon.
+
+Después, `codex` se ejecuta con normalidad. En PRoot no están disponibles `codex agents` ni `codex remote-control`, porque necesitan el daemon. Para reactivarlo: `codex features enable daemon_auto_start`.
 
 ## Alcance
 
