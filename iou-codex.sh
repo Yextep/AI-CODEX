@@ -41,12 +41,17 @@ Opciones:
 Variables:
   CODEX_INSTALL_DIR     Igual que --install-dir.
   LOG_FILE              Log de instalación. Por defecto: /tmp/codex-install-update.log
+  IOU_CODEX_PROOT       1 o 0 fuerza o descarta la detección de PRoot. Por defecto: auto.
 
 En Debian/Ubuntu instala las dependencias del sistema, incluido bubblewrap,
 antes de instalar o actualizar. Usa root o sudo solo para los paquetes apt;
 Codex se instala para el usuario que ejecuta este script.
 El método official/auto vuelve a ejecutar siempre el instalador para reparar
 la instalación, aunque la versión coincida. No requiere Node.js ni npm.
+
+En PRoot (Termux/proot-distro) el servidor en segundo plano de Codex no puede
+arrancar. Si falla, el script desactiva daemon_auto_start para que Codex use
+su servidor integrado, detiene el daemon colgado y limpia el socket roto.
 USAGE
 }
 
@@ -181,14 +186,113 @@ install_from_official() {
 check_daemon() {
   local executable="$1"
   # Las versiones antiguas no tienen daemon. start deja intacto uno ya activo.
-  if "$executable" app-server daemon start --help >/dev/null 2>&1; then
-    info "Comprobando el arranque del servidor de Codex"
-    if ! run_logged "$executable" app-server daemon start; then
-      err "Codex se instaló, pero el servidor no arrancó. Revisa $LOG_FILE y ${CODEX_HOME:-$HOME/.codex}/app-server-daemon/daemon.stderr.log."
-      err "Requisitos del sandbox: https://developers.openai.com/codex/concepts/sandboxing#prerequisites"
-      return 1
+  "$executable" app-server daemon start --help >/dev/null 2>&1 || return 0
+
+  if is_proot; then
+    check_daemon_in_proot "$executable"
+    return
+  fi
+
+  info "Comprobando el arranque del servidor de Codex"
+  if ! run_logged "$executable" app-server daemon start; then
+    err "Codex se instaló, pero el servidor no arrancó. Revisa $LOG_FILE y ${CODEX_HOME:-$HOME/.codex}/app-server-daemon/daemon.stderr.log."
+    err "Requisitos del sandbox: https://developers.openai.com/codex/concepts/sandboxing#prerequisites"
+    err "Para usar Codex sin el servidor en segundo plano: codex --no-daemon"
+    return 1
+  fi
+}
+
+# Termux/proot-distro. IOU_CODEX_PROOT=1 o 0 fuerza la detección.
+is_proot() {
+  case "${IOU_CODEX_PROOT:-auto}" in
+    1) return 0 ;;
+    0) return 1 ;;
+  esac
+  [[ "${container:-}" == proot* || -n "${PROOT_L2S_DIR:-}" ]] && return 0
+  [[ "$(uname -r 2>/dev/null || true)" == *PRoot* ]] && return 0
+  local tracer
+  tracer="$(awk '/^TracerPid:/ {print $2}' /proc/self/status 2>/dev/null || true)"
+  [[ -n "$tracer" && "$tracer" != 0 && "$(cat "/proc/$tracer/comm" 2>/dev/null || true)" == proot* ]]
+}
+
+# Estado de la feature daemon_auto_start: true, false o vacío si no existe.
+daemon_auto_start_state() {
+  local executable="$1" features line
+  # Se captura la salida completa: con pipefail, grep -q cortaría la tubería.
+  features="$("$executable" features list 2>/dev/null || true)"
+  while IFS= read -r line; do
+    if [[ "$line" =~ ^daemon_auto_start[[:space:]].*[[:space:]](true|false)[[:space:]]*$ ]]; then
+      printf '%s\n' "${BASH_REMATCH[1]}"
+      return
+    fi
+  done <<<"$features"
+}
+
+# Desde Codex 0.166 el socket del daemon vive en /tmp/codex-daemon-<uid>/<hash>.
+# En el host esa ruta supera los 108 bytes de sun_path; PRoot reubica el socket
+# y el enlace app-server-control.sock queda roto, así que el daemon nunca está
+# listo. Codex funciona igual con su servidor integrado (como --no-daemon).
+check_daemon_in_proot() {
+  local executable="$1" state
+  state="$(daemon_auto_start_state "$executable")"
+
+  if [[ "$state" == false ]]; then
+    info "PRoot: daemon_auto_start ya está desactivado; Codex usa su servidor integrado"
+    cleanup_proot_daemon
+    return 0
+  fi
+
+  info "Comprobando el arranque del servidor de Codex (PRoot)"
+  if "$executable" app-server daemon start >>"$LOG_FILE" 2>&1; then
+    info "El servidor de Codex arrancó correctamente"
+    return 0
+  fi
+
+  if [[ -z "$state" ]]; then
+    err "El servidor de Codex no arrancó en PRoot y esta versión no permite desactivarlo. Revisa $LOG_FILE."
+    err "Ejecuta Codex con: codex --no-daemon"
+    return 1
+  fi
+
+  warn "El servidor en segundo plano de Codex no puede funcionar en PRoot (ruta de socket demasiado larga)."
+  if ! run_logged "$executable" features disable daemon_auto_start; then
+    err "No pude desactivar daemon_auto_start. Ejecuta Codex con: codex --no-daemon"
+    return 1
+  fi
+  cleanup_proot_daemon
+  info "Codex usará su servidor integrado; ya puedes ejecutar: codex"
+  warn "En PRoot no funcionan 'codex agents' ni 'codex remote-control'. Para reactivar el daemon: codex features enable daemon_auto_start"
+}
+
+# Detiene los daemons inalcanzables y borra los enlaces de socket rotos.
+cleanup_proot_daemon() {
+  local codex_home="${CODEX_HOME:-$HOME/.codex}" pattern rootfs sock host attempt
+  if have pkill; then
+    pattern="$(printf '%s' "$codex_home" | sed 's/[][\.*^$+?(){}|]/\\&/g')"
+    pattern="$pattern/packages/app-server-daemon/releases/[^ ]*/bin/codex app-server"
+    if pkill -f -- "$pattern" 2>/dev/null; then
+      # Mientras el proceso vive, PRoot aún resuelve el socket y el enlace no
+      # parece roto; hay que esperar a que termine antes de limpiarlo.
+      for attempt in 1 2 3 4 5 6 7 8 9 10; do
+        pgrep -f -- "$pattern" >/dev/null 2>&1 || break
+        sleep 0.5
+      done
+      pkill -KILL -f -- "$pattern" 2>/dev/null || true
+      info "Detenido el servidor en segundo plano inalcanzable de Codex"
     fi
   fi
+
+  # Dentro de PRoot el enlace roto no se puede borrar por su ruta; desde la
+  # ruta del host sí. proot-distro define PROOT_L2S_DIR=<rootfs del host>/.l2s.
+  rootfs="${PROOT_L2S_DIR:-}"
+  rootfs="${rootfs%/.l2s}"
+  [[ -n "$rootfs" && "$rootfs" != "${PROOT_L2S_DIR:-}" && "$codex_home" == /* ]] || return 0
+  for sock in app-server-control/app-server-control.sock app-server-daemon/daemon-updater.sock; do
+    host="$rootfs$codex_home/$sock"
+    if [[ -L "$host" && ! -e "$host" ]] && rm -f "$host"; then
+      info "Eliminado enlace de socket roto: $codex_home/$sock"
+    fi
+  done
 }
 
 cleanup_lock() {
